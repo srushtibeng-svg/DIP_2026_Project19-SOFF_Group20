@@ -1,14 +1,8 @@
 """
 utils.py
---------
-Shared helpers for loading optical / SAR field-crop patches and their labels.
 
-EDIT ME: the exact folder layout and label format depend on how the
-YieldSAT-derived dataset was handed to you. Adjust `load_patch`,
-`load_label_table`, etc. to match. The rest of the pipeline
-(optical_features.py, sar_features.py, fusion.py, train_classifier.py)
-only depends on the *return types* documented below, so once these loaders
-are correct everything downstream should work unchanged.
+Shared utilities for loading YieldSAT CSV datasets
+and Sentinel-1 / Sentinel-2 raster patches.
 """
 
 import os
@@ -18,67 +12,155 @@ import pandas as pd
 
 try:
     import rasterio
-except ImportError:  # pragma: no cover
+except ImportError:
     rasterio = None
 
 
-def load_patch(path):
-    """
-    Load a single-field raster patch (optical or SAR) as a numpy array.
+def load_dataset(csv_path):
+    """Load a CSV dataset and validate that it is not empty."""
 
-    Returns
-    -------
-    arr : np.ndarray, shape (bands, H, W)
-    """
-    if rasterio is None:
-        raise ImportError("pip install rasterio --break-system-packages")
-    with rasterio.open(path) as src:
-        arr = src.read()  # (bands, H, W)
-    return arr.astype(np.float32)
+    if not os.path.exists(csv_path):
+        raise FileNotFoundError(
+            f"Dataset file not found: {csv_path}"
+        )
 
+    df = pd.read_csv(csv_path)
 
-def list_field_patches(root_dir, ext="tif"):
-    """
-    Return a sorted list of patch file paths under root_dir.
-    EDIT: adjust the glob pattern to match your actual file naming,
-    e.g. '<field_id>_<date>_optical.tif'.
-    """
-    return sorted(glob.glob(os.path.join(root_dir, f"*.{ext}")))
+    if df.empty:
+        raise ValueError("The dataset is empty.")
 
-
-def field_id_from_path(path):
-    """
-    EDIT ME: parse the field/patch identifier out of a filename so that
-    optical and SAR patches for the *same* field can be matched up.
-    """
-    fname = os.path.basename(path)
-    return os.path.splitext(fname)[0]
+    return df
 
 
 def load_label_table(csv_path):
     """
-    Load the crop-type / yield label table.
+    Load a dataset containing crop labels.
 
-    Expected columns (EDIT to match the real file):
-        field_id, crop_type, yield_value (optional)
-
-    Returns
-    -------
-    pd.DataFrame indexed by field_id
+    The actual field identifier is retained in the columns.
     """
-    df = pd.read_csv(csv_path)
-    df = df.set_index("field_id")
+
+    df = load_dataset(csv_path)
+
+    required_columns = ["crop"]
+
+    for column in required_columns:
+        if column not in df.columns:
+            raise ValueError(
+                f"Required column '{column}' not found."
+            )
+
     return df
+
+
+def load_patch(path):
+    """
+    Load a raster patch.
+
+    Returns:
+        NumPy array with shape (bands, height, width).
+    """
+
+    if rasterio is None:
+        raise ImportError(
+            "Install rasterio before loading raster patches."
+        )
+
+    if not os.path.exists(path):
+        raise FileNotFoundError(path)
+
+    with rasterio.open(path) as src:
+        patch = src.read().astype(np.float32)
+
+    return patch
+
+
+def list_field_patches(root_dir, ext="tif"):
+    """List raster patches in a directory."""
+
+    pattern = os.path.join(root_dir, f"*.{ext}")
+
+    return sorted(glob.glob(pattern))
+
+
+def field_id_from_path(path):
+    """Return the filename without its extension."""
+
+    return os.path.splitext(
+        os.path.basename(path)
+    )[0]
+
+
+def validate_patch(patch):
+    """Check whether a raster patch has a valid shape."""
+
+    patch = np.asarray(patch)
+
+    if patch.ndim != 3:
+        raise ValueError(
+            "Expected patch shape (bands, height, width)."
+        )
+
+    if patch.shape[0] == 0:
+        raise ValueError("Patch contains no bands.")
+
+    return patch
+
+
+def get_crop_labels(df):
+    """Return crop labels from the dataset."""
+
+    if "crop" not in df.columns:
+        raise ValueError(
+            "The dataset must contain a 'crop' column."
+        )
+
+    return df["crop"].astype(str)
+
+
+def print_dataset_summary(df, dataset_name="Dataset"):
+    """Display basic dataset information."""
+
+    print(f"\n--- {dataset_name} Summary ---")
+    print("Rows:", len(df))
+    print("Columns:", len(df.columns))
+
+    print("\nColumn names:")
+    print(df.columns.tolist())
+
+    print("\nMissing values:")
+    print(df.isnull().sum())
+
+    if "crop" in df.columns:
+        print("\nCrop distribution:")
+        print(df["crop"].value_counts())
 
 
 def yield_to_class(yield_mask, n_bins=3):
     """
-    Optional helper: if you need to derive a classification label from a
-    per-pixel yield mask (rather than using a provided crop-type label),
-    bin the mean yield of the patch into n_bins classes (e.g. low/med/high).
+    Optional utility to convert a numerical yield array
+    into low, medium and high classes.
+
+    This function is not required for crop-type classification.
     """
-    mean_yield = np.nanmean(yield_mask)
-    # EDIT: replace with bin edges computed from your actual yield distribution
-    edges = np.linspace(np.nanmin(yield_mask), np.nanmax(yield_mask), n_bins + 1)
-    label = np.digitize(mean_yield, edges[1:-1])
+
+    values = np.asarray(yield_mask, dtype=float)
+    values = values[np.isfinite(values)]
+
+    if values.size == 0:
+        raise ValueError("No valid yield values found.")
+
+    if n_bins < 2:
+        raise ValueError("n_bins must be at least 2.")
+
+    edges = np.linspace(
+        values.min(),
+        values.max(),
+        n_bins + 1
+    )
+
+    label = np.digitize(
+        values.mean(),
+        edges[1:-1]
+    )
+
     return int(label)
