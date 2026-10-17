@@ -1,82 +1,176 @@
 """
 sar_features.py
-----------------
-Classical hand-crafted feature extraction from Sentinel-1 SAR patches
-(exported via Google Earth Engine — see gee_sar_export.py).
 
-Assumes a two-band stack: [VV, VH] backscatter (linear or dB — EDIT
-`IS_DB` below to match whatever units you exported from GEE).
+Feature extraction from Sentinel-1 VV and VH raster patches.
 """
 
 import numpy as np
 from skimage.feature import graycomatrix, graycoprops
 
-SAR_BAND_IDX = {"vv": 0, "vh": 1}
-IS_DB = True  # set False if you exported linear backscatter instead of dB
 
+def extract_band_statistics(band, prefix):
+    """Calculate basic statistics for one SAR band."""
 
-def to_db(x):
-    """Convert linear backscatter to dB if needed."""
-    return 10 * np.log10(np.clip(x, 1e-6, None))
+    band = np.asarray(band, dtype=float)
+    valid = band[np.isfinite(band)]
 
+    if valid.size == 0:
+        return {
+            f"{prefix}_mean": np.nan,
+            f"{prefix}_std": np.nan,
+            f"{prefix}_min": np.nan,
+            f"{prefix}_max": np.nan
+        }
 
-def backscatter_statistics(patch):
-    """Mean/std/median per polarization + VV/VH ratio."""
-    vv = patch[SAR_BAND_IDX["vv"]]
-    vh = patch[SAR_BAND_IDX["vh"]]
-
-    if not IS_DB:
-        vv, vh = to_db(vv), to_db(vh)
-
-    feats = {
-        "vv_mean": float(np.nanmean(vv)),
-        "vv_std": float(np.nanstd(vv)),
-        "vv_median": float(np.nanmedian(vv)),
-        "vh_mean": float(np.nanmean(vh)),
-        "vh_std": float(np.nanstd(vh)),
-        "vh_median": float(np.nanmedian(vh)),
+    return {
+        f"{prefix}_mean": float(valid.mean()),
+        f"{prefix}_std": float(valid.std()),
+        f"{prefix}_min": float(valid.min()),
+        f"{prefix}_max": float(valid.max())
     }
-    feats["vv_vh_ratio_mean"] = feats["vv_mean"] - feats["vh_mean"]  # dB domain: ratio = subtraction
-    return feats
 
 
-def glcm_texture_sar(patch, band="vv", levels=32, distances=(1,), angles=(0,)):
-    """GLCM texture on SAR backscatter (speckle-aware: quantize after dB scaling)."""
-    band_arr = patch[SAR_BAND_IDX[band]]
-    if not IS_DB:
-        band_arr = to_db(band_arr)
+def extract_ratio_features(vv, vh):
+    """Calculate VV/VH ratio using linear backscatter values."""
 
-    finite = band_arr[np.isfinite(band_arr)]
+    vv = np.asarray(vv, dtype=float)
+    vh = np.asarray(vh, dtype=float)
+
+    valid = (
+        np.isfinite(vv)
+        & np.isfinite(vh)
+        & (np.abs(vh) > 1e-8)
+    )
+
+    if not valid.any():
+        return {
+            "vv_vh_ratio_mean": np.nan,
+            "vv_vh_ratio_std": np.nan
+        }
+
+    ratio = vv[valid] / vh[valid]
+
+    return {
+        "vv_vh_ratio_mean": float(ratio.mean()),
+        "vv_vh_ratio_std": float(ratio.std())
+    }
+
+
+def extract_glcm_features(
+    band,
+    prefix,
+    levels=32
+):
+    """Extract texture features from a 2D SAR band."""
+
+    band = np.asarray(band, dtype=float)
+
+    if band.ndim != 2:
+        raise ValueError(
+            "Expected a 2D image band."
+        )
+
+    finite = band[np.isfinite(band)]
+
+    props = [
+        "contrast",
+        "homogeneity",
+        "energy",
+        "correlation"
+    ]
+
     if finite.size == 0:
-        return {f"glcm_{band}_{p}": 0.0 for p in
-                ["contrast", "homogeneity", "energy", "correlation"]}
+        return {
+            f"{prefix}_glcm_{p}": np.nan
+            for p in props
+        }
 
-    lo, hi = np.percentile(finite, 1), np.percentile(finite, 99)
-    scaled = np.clip((band_arr - lo) / (hi - lo + 1e-6), 0, 1)
-    quantized = (scaled * (levels - 1)).astype(np.uint8)
+    low, high = np.percentile(finite, [1, 99])
 
-    glcm = graycomatrix(quantized, distances=list(distances), angles=list(angles),
-                         levels=levels, symmetric=True, normed=True)
+    if high <= low:
+        quantized = np.zeros(
+            band.shape,
+            dtype=np.uint8
+        )
+    else:
+        scaled = np.clip(
+            (band - low) / (high - low),
+            0,
+            1
+        )
 
-    feats = {}
-    for prop in ["contrast", "homogeneity", "energy", "correlation"]:
-        feats[f"glcm_{band}_{prop}"] = float(np.mean(graycoprops(glcm, prop)))
-    return feats
+        quantized = np.zeros(
+            band.shape,
+            dtype=np.uint8
+        )
+
+        valid = np.isfinite(band)
+
+        quantized[valid] = (
+            scaled[valid] * (levels - 1)
+        ).astype(np.uint8)
+
+    glcm = graycomatrix(
+        quantized,
+        distances=[1],
+        angles=[0],
+        levels=levels,
+        symmetric=True,
+        normed=True
+    )
+
+    features = {}
+
+    for prop in props:
+        features[f"{prefix}_glcm_{prop}"] = float(
+            np.mean(graycoprops(glcm, prop))
+        )
+
+    return features
 
 
 def extract_sar_features(patch):
     """
-    Main entry point: given one SAR patch (2, H, W) = [VV, VH], return a
-    flat dict of feature_name -> value.
+    Extract features from a SAR patch.
 
-    NOTE: apply speckle filtering (e.g. a Lee or refined-Lee filter, or a
-    simple median filter) upstream before feature extraction if your GEE
-    export didn't already smooth the data — raw single-look SAR is noisy
-    enough that texture features can be dominated by speckle rather than
-    genuine field structure.
+    Expected shape:
+        (2, height, width)
+
+    Band order:
+        0 = VV
+        1 = VH
     """
-    feats = {}
-    feats.update(backscatter_statistics(patch))
-    feats.update(glcm_texture_sar(patch, band="vv"))
-    feats.update(glcm_texture_sar(patch, band="vh"))
-    return feats
+
+    patch = np.asarray(patch, dtype=float)
+
+    if patch.ndim != 3 or patch.shape[0] < 2:
+        raise ValueError(
+            "SAR patch must contain VV and VH bands."
+        )
+
+    vv = patch[0]
+    vh = patch[1]
+
+    features = {}
+
+    features.update(
+        extract_band_statistics(vv, "vv")
+    )
+
+    features.update(
+        extract_band_statistics(vh, "vh")
+    )
+
+    features.update(
+        extract_ratio_features(vv, vh)
+    )
+
+    features.update(
+        extract_glcm_features(vv, "vv")
+    )
+
+    features.update(
+        extract_glcm_features(vh, "vh")
+    )
+
+    return features
