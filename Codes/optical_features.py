@@ -1,92 +1,261 @@
 """
 optical_features.py
---------------------
-Classical hand-crafted feature extraction from Sentinel-2 optical patches.
 
-Assumes a Sentinel-2 patch with at least these bands (EDIT band indices to
-match your actual stack order):
-    B2 (Blue), B3 (Green), B4 (Red), B8 (NIR)  -- minimum for NDVI/NDWI
-Add B5/B8A/B11/B12 etc. if your provided stack includes them.
+Extract spectral indices, band statistics and GLCM
+texture features from Sentinel-2 raster patches.
 """
 
 import numpy as np
 from skimage.feature import graycomatrix, graycoprops
 
-# EDIT: set these to the actual band order in your provided GeoTIFFs
-BAND_IDX = {"blue": 0, "green": 1, "red": 2, "nir": 3}
+
+def safe_ratio(a, b, eps=1e-6):
+    """Calculate (a - b) / (a + b) safely."""
+
+    denominator = a + b
+
+    result = np.full(
+        np.broadcast_shapes(a.shape, b.shape),
+        np.nan,
+        dtype=float
+    )
+
+    valid = (
+        np.isfinite(a)
+        & np.isfinite(b)
+        & (np.abs(denominator) > eps)
+    )
+
+    result[valid] = (
+        (a[valid] - b[valid])
+        / denominator[valid]
+    )
+
+    return result
 
 
-def _safe_ratio(a, b, eps=1e-6):
-    return (a - b) / (a + b + eps)
+def get_band(patch, band_index):
+    """Return one band from a raster patch."""
+
+    patch = np.asarray(patch, dtype=float)
+
+    if patch.ndim != 3:
+        raise ValueError(
+            "Patch must have shape (bands, height, width)."
+        )
+
+    if band_index < 0 or band_index >= patch.shape[0]:
+        raise ValueError(
+            f"Invalid band index: {band_index}"
+        )
+
+    return patch[band_index]
 
 
-def spectral_indices(patch):
+def spectral_indices(patch, band_idx):
     """
-    patch: np.ndarray (bands, H, W)
-    Returns dict of scalar indices (mean over the patch).
+    Extract mean and standard deviation of spectral indices.
+
+    band_idx example:
+        {
+            "blue": 0,
+            "green": 1,
+            "red": 2,
+            "nir": 3
+        }
+
+    The indices must match the actual GeoTIFF band order.
     """
-    blue = patch[BAND_IDX["blue"]]
-    green = patch[BAND_IDX["green"]]
-    red = patch[BAND_IDX["red"]]
-    nir = patch[BAND_IDX["nir"]]
 
-    ndvi = _safe_ratio(nir, red)
-    ndwi = _safe_ratio(green, nir)
-    evi = 2.5 * (nir - red) / (nir + 6 * red - 7.5 * blue + 1 + 1e-6)
-    savi = _safe_ratio(nir, red) * 1.5  # simplified SAVI, L=0.5 folded in loosely; refine if needed
+    blue = get_band(patch, band_idx["blue"])
+    green = get_band(patch, band_idx["green"])
+    red = get_band(patch, band_idx["red"])
+    nir = get_band(patch, band_idx["nir"])
 
-    return {
-        "ndvi_mean": float(np.nanmean(ndvi)),
-        "ndvi_std": float(np.nanstd(ndvi)),
-        "ndwi_mean": float(np.nanmean(ndwi)),
-        "evi_mean": float(np.nanmean(evi)),
-        "savi_mean": float(np.nanmean(savi)),
+    ndvi = safe_ratio(nir, red)
+    ndwi = safe_ratio(green, nir)
+
+    evi_denominator = (
+        nir + 6 * red - 7.5 * blue + 1
+    )
+
+    evi = np.full_like(nir, np.nan, dtype=float)
+
+    valid_evi = (
+        np.isfinite(nir)
+        & np.isfinite(red)
+        & np.isfinite(blue)
+        & (np.abs(evi_denominator) > 1e-6)
+    )
+
+    evi[valid_evi] = (
+        2.5
+        * (nir[valid_evi] - red[valid_evi])
+        / evi_denominator[valid_evi]
+    )
+
+    # Standard SAVI formula with L = 0.5.
+    savi_denominator = nir + red + 0.5
+
+    savi = np.full_like(nir, np.nan, dtype=float)
+
+    valid_savi = (
+        np.isfinite(nir)
+        & np.isfinite(red)
+        & (np.abs(savi_denominator) > 1e-6)
+    )
+
+    savi[valid_savi] = (
+        1.5
+        * (nir[valid_savi] - red[valid_savi])
+        / savi_denominator[valid_savi]
+    )
+
+    indices = {
+        "ndvi": ndvi,
+        "ndwi": ndwi,
+        "evi": evi,
+        "savi": savi
     }
 
+    features = {}
 
-def band_statistics(patch):
-    """Basic per-band mean/std — cheap but often useful baseline features."""
-    feats = {}
-    for name, idx in BAND_IDX.items():
-        band = patch[idx]
-        feats[f"{name}_mean"] = float(np.nanmean(band))
-        feats[f"{name}_std"] = float(np.nanstd(band))
-    return feats
+    for name, values in indices.items():
+        features[f"{name}_mean"] = (
+            float(np.nanmean(values))
+            if np.isfinite(values).any()
+            else np.nan
+        )
+
+        features[f"{name}_std"] = (
+            float(np.nanstd(values))
+            if np.isfinite(values).any()
+            else np.nan
+        )
+
+    return features
 
 
-def glcm_texture(patch, band="nir", levels=32, distances=(1,), angles=(0,)):
-    """
-    Gray-Level Co-occurrence Matrix texture features on one band.
-    Quantizes the band to `levels` gray levels before computing GLCM.
-    """
-    band_arr = patch[BAND_IDX[band]]
-    finite = band_arr[np.isfinite(band_arr)]
+def band_statistics(patch, band_idx):
+    """Calculate mean and standard deviation for each selected band."""
+
+    features = {}
+
+    for name, index in band_idx.items():
+        band = get_band(patch, index)
+        valid = band[np.isfinite(band)]
+
+        if valid.size == 0:
+            features[f"{name}_mean"] = np.nan
+            features[f"{name}_std"] = np.nan
+        else:
+            features[f"{name}_mean"] = float(valid.mean())
+            features[f"{name}_std"] = float(valid.std())
+
+    return features
+
+
+def glcm_texture(
+    patch,
+    band_idx,
+    band="nir",
+    levels=32
+):
+    """Extract GLCM texture features from one band."""
+
+    if band not in band_idx:
+        raise ValueError(
+            f"Band '{band}' is not present in band_idx."
+        )
+
+    band_array = get_band(
+        patch,
+        band_idx[band]
+    )
+
+    finite = band_array[np.isfinite(band_array)]
+
+    properties = [
+        "contrast",
+        "homogeneity",
+        "energy",
+        "correlation"
+    ]
+
     if finite.size == 0:
-        return {f"glcm_{band}_{p}": 0.0 for p in
-                ["contrast", "homogeneity", "energy", "correlation"]}
+        return {
+            f"glcm_{band}_{prop}": np.nan
+            for prop in properties
+        }
 
-    lo, hi = np.percentile(finite, 1), np.percentile(finite, 99)
-    scaled = np.clip((band_arr - lo) / (hi - lo + 1e-6), 0, 1)
-    quantized = (scaled * (levels - 1)).astype(np.uint8)
+    low, high = np.percentile(finite, [1, 99])
 
-    glcm = graycomatrix(quantized, distances=list(distances), angles=list(angles),
-                         levels=levels, symmetric=True, normed=True)
+    if high <= low:
+        quantized = np.zeros(
+            band_array.shape,
+            dtype=np.uint8
+        )
+    else:
+        scaled = np.clip(
+            (band_array - low) / (high - low),
+            0,
+            1
+        )
 
-    feats = {}
-    for prop in ["contrast", "homogeneity", "energy", "correlation"]:
-        feats[f"glcm_{band}_{prop}"] = float(np.mean(graycoprops(glcm, prop)))
-    return feats
+        quantized = np.zeros(
+            band_array.shape,
+            dtype=np.uint8
+        )
+
+        valid = np.isfinite(band_array)
+
+        quantized[valid] = (
+            scaled[valid] * (levels - 1)
+        ).astype(np.uint8)
+
+    glcm = graycomatrix(
+        quantized,
+        distances=[1],
+        angles=[0],
+        levels=levels,
+        symmetric=True,
+        normed=True
+    )
+
+    features = {}
+
+    for prop in properties:
+        features[f"glcm_{band}_{prop}"] = float(
+            np.mean(graycoprops(glcm, prop))
+        )
+
+    return features
 
 
-def extract_optical_features(patch):
-    """
-    Main entry point: given one optical patch (bands, H, W), return a flat
-    dict of feature_name -> value. Combine into a single feature vector
-    downstream (see fusion.py).
-    """
-    feats = {}
-    feats.update(band_statistics(patch))
-    feats.update(spectral_indices(patch))
-    feats.update(glcm_texture(patch, band="nir"))
-    feats.update(glcm_texture(patch, band="red"))
-    return feats
+def extract_optical_features(
+    patch,
+    band_idx
+):
+    """Return a dictionary of optical features."""
+
+    features = {}
+
+    features.update(
+        band_statistics(patch, band_idx)
+    )
+
+    features.update(
+        spectral_indices(patch, band_idx)
+    )
+
+    for band in ["nir", "red"]:
+        if band in band_idx:
+            features.update(
+                glcm_texture(
+                    patch,
+                    band_idx,
+                    band=band
+                )
+            )
+
+    return features
