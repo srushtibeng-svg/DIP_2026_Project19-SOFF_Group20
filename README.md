@@ -58,9 +58,9 @@ every **Saturday, 5:00 PM**, except during the midterm exam week.
 | Milestone | Status |
 |---|---|
 | Repo + plan set up | ✅ |
-| Data exploration | ⬜ |
-| GEE SAR acquisition | ⬜ |
-| Optical feature extraction | ⬜ |
+| Data exploration | ✅ |
+| GEE SAR acquisition | ✅ |
+| Optical feature extraction | ✅ |
 | SAR feature extraction | ⬜ |
 | Feature fusion | ⬜ |
 | Optical-only model | ⬜ |
